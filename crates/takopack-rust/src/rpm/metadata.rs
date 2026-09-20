@@ -594,6 +594,54 @@ impl Package {
                 dep.version = Some(format!(">= {}", version_str));
             }
         }
+
+        for requirement in &mut self.crate_requires {
+            let selected = lockfile_deps
+                .iter()
+                .filter_map(|(name, version)| {
+                    let crate_base = spec::normalize_crate_name(name);
+                    if requirement.crate_name == crate_base
+                        || requirement
+                            .crate_name
+                            .starts_with(&format!("{}-", crate_base))
+                    {
+                        Some((crate_base, version))
+                    } else {
+                        None
+                    }
+                })
+                .max_by_key(|(crate_base, _)| crate_base.len());
+            let Some((crate_base, version)) = selected else {
+                continue;
+            };
+
+            requirement.crate_name = if !version.pre.is_empty() {
+                format!(
+                    "{}-{}.{}.{}-{}",
+                    crate_base, version.major, version.minor, version.patch, version.pre
+                )
+            } else {
+                format!(
+                    "{}-{}",
+                    crate_base,
+                    takopack_core::util::calculate_compat_version(version)
+                )
+            };
+            let version = if !version.build.is_empty() {
+                format!(
+                    "{}.{}.{}+{}",
+                    version.major, version.minor, version.patch, version.build
+                )
+            } else if !version.pre.is_empty() {
+                format!(
+                    "{}.{}.{}-{}",
+                    version.major, version.minor, version.patch, version.pre
+                )
+            } else {
+                format!("{}.{}.{}", version.major, version.minor, version.patch)
+            };
+            requirement.requirement = RequirementVersion::Range(format!(">= {}", version));
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

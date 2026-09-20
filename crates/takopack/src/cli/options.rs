@@ -61,6 +61,10 @@ pub enum CargoOpt {
         )]
         output: Option<std::path::PathBuf>,
 
+        /// Cargo.lock containing the exact dependency selection for this package
+        #[arg(long, value_name = "PATH")]
+        lockfile: Option<std::path::PathBuf>,
+
         #[command(flatten)]
         finish: PackageExecuteArgs,
 

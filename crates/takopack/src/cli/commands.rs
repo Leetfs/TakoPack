@@ -32,15 +32,17 @@ fn real_main() -> Result<i32> {
             CargoOpt::LocalPackage {
                 path,
                 output,
+                lockfile,
                 finish,
                 range_capability_policy,
             } => {
                 log::info!("packaging from local directory: {:?}", path);
-                takopack_rust::local::process_local_package(
+                takopack_rust::local::process_local_package_with_lockfile(
                     &path,
                     output,
                     finish,
                     range_capability_policy,
+                    lockfile.as_deref(),
                 )?;
                 Ok(0)
             }

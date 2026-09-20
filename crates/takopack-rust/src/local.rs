@@ -1,6 +1,6 @@
 use crate::rpm::{self, RpmPackageInfo};
 use anyhow::{Context, Result};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use takopack_core::config::Config;
@@ -17,6 +17,23 @@ pub fn process_local_package(
     output_dir: Option<PathBuf>,
     finish_args: PackageExecuteArgs,
     range_capability_policy: RangeCapabilityPolicy,
+) -> Result<()> {
+    process_local_package_with_lockfile(
+        path,
+        output_dir,
+        finish_args,
+        range_capability_policy,
+        None,
+    )
+}
+
+/// Process a local crate directory using dependency versions selected by a Cargo.lock.
+pub fn process_local_package_with_lockfile(
+    path: &Path,
+    output_dir: Option<PathBuf>,
+    finish_args: PackageExecuteArgs,
+    range_capability_policy: RangeCapabilityPolicy,
+    lockfile: Option<&Path>,
 ) -> Result<()> {
     // Canonicalize the path first to get absolute path
     let path_abs =
@@ -62,6 +79,7 @@ pub fn process_local_package(
         output_dir,
         finish_args,
         range_capability_policy,
+        lockfile,
     )
 }
 
@@ -255,8 +273,9 @@ fn process_complete_crate(
     temp_crate_dir: &Path,
     cargo_toml: &Path,
     output_dir: Option<PathBuf>,
-    finish_args: PackageExecuteArgs,
+    mut finish_args: PackageExecuteArgs,
     range_capability_policy: RangeCapabilityPolicy,
+    lockfile: Option<&Path>,
 ) -> Result<()> {
     // Load config if available
     let config_path = temp_crate_dir.join("takopack.toml");
@@ -277,6 +296,11 @@ fn process_complete_crate(
 
     log::info!("Crate: {} {}", crate_name, version);
 
+    if let Some(lockfile) = lockfile {
+        finish_args.lockfile_deps =
+            lockfile_dependencies_for_package(lockfile, crate_name, &version.to_string())?;
+    }
+
     // Create RpmPackageInfo
     let rpm_info =
         RpmPackageInfo::new(&crate_info, env!("CARGO_PKG_VERSION"), config.semver_suffix);
@@ -284,10 +308,17 @@ fn process_complete_crate(
     let output_names = takopack_core::util::rust_crate_output_names(crate_name, version);
 
     if range_capability_policy != RangeCapabilityPolicy::Allow {
-        let warnings = range_audit::audit_cargo_dependencies(
+        let mut warnings = range_audit::audit_cargo_dependencies(
             crate_info.dependencies(),
             Some(&output_names.directory),
         );
+        if let Some(lockfile_deps) = finish_args.lockfile_deps.as_ref() {
+            warnings.retain(|warning| {
+                let dash_name = warning.dependency.replace('_', "-");
+                !lockfile_deps.contains_key(&warning.dependency)
+                    && !lockfile_deps.contains_key(&dash_name)
+            });
+        }
         if range_audit::emit_warnings(&warnings, range_capability_policy) {
             anyhow::bail!("range capability audit failed (policy: error)");
         }
@@ -366,7 +397,10 @@ fn process_complete_crate(
 
 #[cfg(test)]
 mod tests {
-    use super::{materialize_manifest_backed_temp_crate, process_local_package};
+    use super::{
+        lockfile_dependencies_for_package, materialize_manifest_backed_temp_crate,
+        process_local_package, process_local_package_with_lockfile,
+    };
     use crate::package::PackageExecuteArgs;
     use crate::range_audit::RangeCapabilityPolicy;
 
@@ -634,4 +668,200 @@ rustls = { version = "0.21", optional = true }
             spec.contains("Provides:       crate(%{pkgname}/rustls-tls-manual-roots) = %{version}")
         );
     }
+
+    #[test]
+    fn lockfile_selects_direct_dependency_version_for_current_package() {
+        let temp = tempfile::tempdir().unwrap();
+        let lockfile = temp.path().join("Cargo.lock");
+        fs::write(
+            &lockfile,
+            r#"
+version = 4
+
+[[package]]
+name = "consumer"
+version = "1.2.3"
+dependencies = [
+ "itertools 0.14.0",
+]
+
+[[package]]
+name = "itertools"
+version = "0.10.5"
+
+[[package]]
+name = "itertools"
+version = "0.14.0"
+"#,
+        )
+        .unwrap();
+
+        let selected = lockfile_dependencies_for_package(&lockfile, "consumer", "1.2.3")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            selected.get("itertools"),
+            Some(&Version::parse("0.14.0").unwrap())
+        );
+    }
+
+    #[test]
+    fn localpkg_uses_lock_selected_compat_capability() {
+        let source = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        fs::write(
+            source.path().join("Cargo.toml"),
+            r#"
+[package]
+name = "range_consumer"
+version = "1.2.3"
+edition = "2021"
+
+[dependencies]
+itertools = ">=0.10.1, <=0.14"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            source.path().join("Cargo.lock"),
+            r#"
+version = 4
+
+[[package]]
+name = "range_consumer"
+version = "1.2.3"
+dependencies = [
+ "itertools 0.14.0",
+]
+
+[[package]]
+name = "itertools"
+version = "0.10.5"
+
+[[package]]
+name = "itertools"
+version = "0.14.0"
+"#,
+        )
+        .unwrap();
+
+        let finish = PackageExecuteArgs {
+            changelog_ready: false,
+            copyright_guess_harder: false,
+            no_overlay_write_back: false,
+            with_spdx: false,
+            lockfile_deps: None,
+        };
+        let output_names =
+            rust_crate_output_names("range_consumer", &Version::parse("1.2.3").unwrap());
+        let output_root = output.path().join("explicit-output-root");
+
+        process_local_package_with_lockfile(
+            source.path(),
+            Some(output_root.clone()),
+            finish,
+            RangeCapabilityPolicy::Error,
+            Some(&source.path().join("Cargo.lock")),
+        )
+        .unwrap();
+
+        let spec = fs::read_to_string(
+            output_root
+                .join(&output_names.directory)
+                .join(&output_names.spec_file),
+        )
+        .unwrap();
+        assert!(spec.contains("Requires:       crate(itertools-0.14/default) >= 0.14.0"));
+        assert!(!spec.contains("crate(itertools-0.10/"));
+    }
+}
+
+fn lockfile_dependencies_for_package(
+    lockfile: &Path,
+    package_name: &str,
+    package_version: &str,
+) -> Result<Option<HashMap<String, semver::Version>>> {
+    let content = fs::read_to_string(lockfile)
+        .with_context(|| format!("Failed to read Cargo.lock: {:?}", lockfile))?;
+    let document: Value = toml::from_str(&content)
+        .with_context(|| format!("Failed to parse Cargo.lock: {:?}", lockfile))?;
+    let packages = document
+        .get("package")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("Cargo.lock has no package array: {:?}", lockfile))?;
+
+    let current = packages.iter().find(|package| {
+        package.get("name").and_then(Value::as_str) == Some(package_name)
+            && package.get("version").and_then(Value::as_str) == Some(package_version)
+    });
+    let Some(current) = current else {
+        log::warn!(
+            "Cargo.lock {:?} has no package {} {}; keeping Cargo.toml dependency ranges",
+            lockfile,
+            package_name,
+            package_version
+        );
+        return Ok(None);
+    };
+
+    let Some(dependencies) = current.get("dependencies").and_then(Value::as_array) else {
+        return Ok(Some(HashMap::new()));
+    };
+
+    let mut selected = HashMap::new();
+    let mut conflicts = BTreeSet::new();
+    for dependency in dependencies.iter().filter_map(Value::as_str) {
+        let mut fields = dependency.split_whitespace();
+        let Some(name) = fields.next() else {
+            continue;
+        };
+        let explicit_version = fields
+            .next()
+            .and_then(|field| semver::Version::parse(field).ok());
+        let candidates: Vec<_> = packages
+            .iter()
+            .filter(|package| package.get("name").and_then(Value::as_str) == Some(name))
+            .filter_map(|package| {
+                let version = package.get("version").and_then(Value::as_str)?;
+                semver::Version::parse(version).ok()
+            })
+            .filter(|version| {
+                explicit_version
+                    .as_ref()
+                    .is_none_or(|expected| version == expected)
+            })
+            .collect();
+
+        if candidates.len() != 1 {
+            log::warn!(
+                "Cargo.lock dependency {:?} of {} {} resolves to {} package entries; keeping its Cargo.toml range",
+                dependency,
+                package_name,
+                package_version,
+                candidates.len()
+            );
+            continue;
+        }
+
+        let version = candidates[0].clone();
+        match selected.get(name) {
+            Some(existing) if existing != &version => {
+                conflicts.insert(name.to_string());
+            }
+            None => {
+                selected.insert(name.to_string(), version);
+            }
+            _ => {}
+        }
+    }
+    for name in conflicts {
+        selected.remove(&name);
+        log::warn!(
+            "Cargo.lock selects multiple versions of dependency {} for {} {}; keeping its Cargo.toml range",
+            name,
+            package_name,
+            package_version
+        );
+    }
+    Ok(Some(selected))
 }
