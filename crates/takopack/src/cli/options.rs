@@ -61,9 +61,13 @@ pub enum CargoOpt {
         )]
         output: Option<std::path::PathBuf>,
 
-        /// Cargo.lock containing the exact dependency selection for this package
+        /// Cargo.lock containing exact dependency and Git source selections.
         #[arg(long, value_name = "PATH")]
         lockfile: Option<std::path::PathBuf>,
+
+        /// Previously downloaded Git archive to hash and inspect instead of downloading it.
+        #[arg(long, value_name = "PATH", requires = "lockfile")]
+        source_archive: Option<std::path::PathBuf>,
 
         #[command(flatten)]
         finish: PackageExecuteArgs,

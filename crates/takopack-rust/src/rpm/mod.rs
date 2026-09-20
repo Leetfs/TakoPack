@@ -26,6 +26,18 @@ use crate::crates::{CrateDepInfo, CrateInfo, all_dependencies_and_features, show
 pub mod metadata;
 pub mod spec;
 
+/// A non-crates.io source archive selected by a reproducible package source.
+///
+/// `source_url` may contain RPM macros declared in `source_macros`.  `prep_dir`
+/// is the exact top-level directory found in the downloaded archive.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceArchiveOverride {
+    pub source_macros: Vec<(String, String)>,
+    pub source_url: String,
+    pub sha256: String,
+    pub prep_dir: String,
+}
+
 pub struct RpmPackageInfo {
     upstream_name: String,
     /// takopack package name without `rust-` prefix or any semver suffix
@@ -323,6 +335,7 @@ pub fn prepare_takopack_folder(
     _copyright_guess_harder: bool,
     overlay_write_back: bool,
     sha256: Option<String>, // SHA256 hash of downloaded crate
+    source_archive_override: Option<SourceArchiveOverride>,
     lockfile_deps: Option<std::collections::HashMap<String, semver::Version>>, // Optional: dependencies from Cargo.lock
     with_spdx: bool,
 ) -> Result<()> {
@@ -367,6 +380,7 @@ pub fn prepare_takopack_folder(
         crate_info,
         config,
         sha256,
+        source_archive_override,
         lockfile_deps.as_ref(),
         &mut file,
         with_spdx,
@@ -393,6 +407,7 @@ fn prepare_takopack_spec<F: FnMut(&str) -> std::result::Result<fs::File, io::Err
     crate_info: &CrateInfo,
     config: &Config,
     sha256: Option<String>, // SHA256 hash of downloaded crate
+    source_archive_override: Option<SourceArchiveOverride>,
     lockfile_deps: Option<&HashMap<String, semver::Version>>, // Optional lockfile dependencies
     mut file: F,
     with_spdx: bool,
@@ -403,7 +418,14 @@ fn prepare_takopack_spec<F: FnMut(&str) -> std::result::Result<fs::File, io::Err
 
     let lib = crate_info.is_lib();
     let bins = crate_info.get_binary_targets();
-    let prepared = prepare_spec_source(rpm_info, crate_info, config, sha256, with_spdx)?;
+    let prepared = prepare_spec_source(
+        rpm_info,
+        crate_info,
+        config,
+        sha256,
+        source_archive_override,
+        with_spdx,
+    )?;
 
     let output_names = util::rust_crate_output_names(crate_name, crate_info.version());
     let mut spec_file = io::BufWriter::new(file(&output_names.spec_file)?);
@@ -454,6 +476,7 @@ fn prepare_spec_source(
     crate_info: &CrateInfo,
     config: &Config,
     sha256: Option<String>,
+    source_archive_override: Option<SourceArchiveOverride>,
     with_spdx: bool,
 ) -> Result<PreparedSpec> {
     let crate_name = crate_info.crate_name();
@@ -477,6 +500,7 @@ fn prepare_spec_source(
         &license,
         full_version,
         sha256,
+        source_archive_override,
     )?;
     source.apply_overrides(config, with_spdx);
 

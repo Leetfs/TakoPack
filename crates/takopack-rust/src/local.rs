@@ -1,10 +1,14 @@
-use crate::rpm::{self, RpmPackageInfo};
+use crate::rpm::{self, RpmPackageInfo, SourceArchiveOverride};
 use anyhow::{Context, Result};
+use flate2::read::GzDecoder;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::io::{Cursor, Read};
 use std::path::{Component, Path, PathBuf};
 use takopack_core::config::Config;
 use takopack_core::util::write_file_ensuring_dir;
+use tar::Archive;
 use toml::Value;
 
 use crate::crates::CrateInfo;
@@ -18,16 +22,17 @@ pub fn process_local_package(
     finish_args: PackageExecuteArgs,
     range_capability_policy: RangeCapabilityPolicy,
 ) -> Result<()> {
-    process_local_package_with_lockfile(
+    process_local_package_with_source(
         path,
         output_dir,
         finish_args,
         range_capability_policy,
         None,
+        None,
     )
 }
 
-/// Process a local crate directory using dependency versions selected by a Cargo.lock.
+/// Process a local crate using exact dependency versions from Cargo.lock.
 pub fn process_local_package_with_lockfile(
     path: &Path,
     output_dir: Option<PathBuf>,
@@ -35,6 +40,34 @@ pub fn process_local_package_with_lockfile(
     range_capability_policy: RangeCapabilityPolicy,
     lockfile: Option<&Path>,
 ) -> Result<()> {
+    process_local_package_with_source(
+        path,
+        output_dir,
+        finish_args,
+        range_capability_policy,
+        lockfile,
+        None,
+    )
+}
+
+/// Process a local crate while recovering a reproducible Git source from the
+/// workspace Cargo.lock that selected it.
+///
+/// `source_archive` is an optional already-downloaded copy of the archive. It
+/// is useful for offline/repeatable generation; when omitted, TakoPack fetches
+/// the archive URL derived from the locked Git source.
+pub fn process_local_package_with_source(
+    path: &Path,
+    output_dir: Option<PathBuf>,
+    finish_args: PackageExecuteArgs,
+    range_capability_policy: RangeCapabilityPolicy,
+    lockfile: Option<&Path>,
+    source_archive: Option<&Path>,
+) -> Result<()> {
+    if source_archive.is_some() && lockfile.is_none() {
+        anyhow::bail!("--source-archive requires --lockfile");
+    }
+
     // Canonicalize the path first to get absolute path
     let path_abs =
         fs::canonicalize(path).with_context(|| format!("Failed to resolve path: {:?}", path))?;
@@ -80,6 +113,7 @@ pub fn process_local_package_with_lockfile(
         finish_args,
         range_capability_policy,
         lockfile,
+        source_archive,
     )
 }
 
@@ -276,6 +310,7 @@ fn process_complete_crate(
     mut finish_args: PackageExecuteArgs,
     range_capability_policy: RangeCapabilityPolicy,
     lockfile: Option<&Path>,
+    source_archive: Option<&Path>,
 ) -> Result<()> {
     // Load config if available
     let config_path = temp_crate_dir.join("takopack.toml");
@@ -306,6 +341,11 @@ fn process_complete_crate(
         RpmPackageInfo::new(&crate_info, env!("CARGO_PKG_VERSION"), config.semver_suffix);
 
     let output_names = takopack_core::util::rust_crate_output_names(crate_name, version);
+
+    let source_archive_override = match lockfile {
+        Some(lock) => git_archive_source_from_lockfile(lock, crate_name, version, source_archive)?,
+        None => None,
+    };
 
     if range_capability_policy != RangeCapabilityPolicy::Allow {
         let mut warnings = range_audit::audit_cargo_dependencies(
@@ -350,6 +390,7 @@ fn process_complete_crate(
         finish_args.copyright_guess_harder,
         !finish_args.no_overlay_write_back,
         None, // TODO: sha256: local packages don't have downloaded crate files, maybe consider record the sha256 when use pkg.
+        source_archive_override,
         finish_args.lockfile_deps, // Pass lockfile dependencies if available
         finish_args.with_spdx,
     );
@@ -395,18 +436,408 @@ fn process_complete_crate(
     Ok(())
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LockedGitReference {
+    Rev,
+    Tag(String),
+    Commit,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LockedGitSource {
+    repository: String,
+    repository_name: String,
+    commit: String,
+    reference: LockedGitReference,
+}
+
+fn git_archive_source_from_lockfile(
+    lockfile: &Path,
+    crate_name: &str,
+    version: &semver::Version,
+    source_archive: Option<&Path>,
+) -> Result<Option<SourceArchiveOverride>> {
+    let content = fs::read_to_string(lockfile)
+        .with_context(|| format!("failed to read Cargo.lock: {}", lockfile.display()))?;
+    let lock: Value = toml::from_str(&content)
+        .with_context(|| format!("failed to parse Cargo.lock: {}", lockfile.display()))?;
+    let packages = lock
+        .get("package")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("Cargo.lock has no [[package]] entries"))?;
+
+    let mut sources = packages.iter().filter_map(|package| {
+        let package = package.as_table()?;
+        if package.get("name")?.as_str()? != crate_name
+            || package.get("version")?.as_str()? != version.to_string()
+        {
+            return None;
+        }
+        package
+            .get("source")?
+            .as_str()
+            .filter(|source| source.starts_with("git+"))
+    });
+    let Some(source) = sources.next() else {
+        if source_archive.is_some() {
+            anyhow::bail!(
+                "--source-archive requires a Git source for {} {} in Cargo.lock",
+                crate_name,
+                version
+            );
+        }
+        return Ok(None);
+    };
+    if sources.next().is_some() {
+        anyhow::bail!(
+            "Cargo.lock has multiple Git sources for {} {}; source selection is ambiguous",
+            crate_name,
+            version
+        );
+    }
+
+    let source = parse_locked_github_source(source)?;
+    let (source_url, fetch_url, source_macros) = match &source.reference {
+        LockedGitReference::Tag(tag) => (
+            format!(
+                "{}/archive/refs/tags/%{{git_tag}}.tar.gz#/%{{crate_name}}-%{{git_tag}}.tar.gz",
+                source.repository
+            ),
+            format!("{}/archive/refs/tags/{}.tar.gz", source.repository, tag),
+            vec![
+                ("git_tag".to_string(), tag.clone()),
+                ("git_commit".to_string(), source.commit.clone()),
+            ],
+        ),
+        LockedGitReference::Rev => (
+            format!(
+                "{}/archive/%{{git_commit}}.tar.gz#/%{{crate_name}}-%{{git_commit}}.tar.gz",
+                source.repository
+            ),
+            format!("{}/archive/{}.tar.gz", source.repository, source.commit),
+            vec![("git_commit".to_string(), source.commit.clone())],
+        ),
+        LockedGitReference::Commit => (
+            format!(
+                "{}/archive/%{{git_commit}}.tar.gz#/%{{crate_name}}-%{{git_commit}}.tar.gz",
+                source.repository
+            ),
+            format!("{}/archive/{}.tar.gz", source.repository, source.commit),
+            vec![("git_commit".to_string(), source.commit.clone())],
+        ),
+    };
+
+    let bytes = match source_archive {
+        Some(path) => fs::read(path)
+            .with_context(|| format!("failed to read source archive: {}", path.display()))?,
+        None => download_archive(&fetch_url)?,
+    };
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let prep_dir = archive_top_level_directory(&bytes)?;
+    if !prep_dir.starts_with(&format!("{}-", source.repository_name)) {
+        anyhow::bail!(
+            "Git archive top-level directory {:?} does not match repository {:?}",
+            prep_dir,
+            source.repository_name
+        );
+    }
+
+    Ok(Some(SourceArchiveOverride {
+        source_macros,
+        source_url,
+        sha256,
+        prep_dir,
+    }))
+}
+
+fn parse_locked_github_source(source: &str) -> Result<LockedGitSource> {
+    let source = source
+        .strip_prefix("git+")
+        .ok_or_else(|| anyhow::anyhow!("not a Cargo Git source: {source}"))?;
+    let (repository_and_query, commit) = source
+        .rsplit_once('#')
+        .ok_or_else(|| anyhow::anyhow!("Cargo Git source has no resolved commit: {source}"))?;
+    if commit.len() != 40 || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("Cargo Git source has an invalid resolved commit: {commit}");
+    }
+    let (repository, query) = repository_and_query
+        .split_once('?')
+        .map_or((repository_and_query, ""), |(repository, query)| {
+            (repository, query)
+        });
+    let repository = repository.trim_end_matches('/').trim_end_matches(".git");
+    let github_path = repository.strip_prefix("https://github.com/").ok_or_else(|| {
+        anyhow::anyhow!(
+            "unsupported Git host in {repository}; localpkg Git archives currently require an HTTPS GitHub source"
+        )
+    })?;
+    let mut path_parts = github_path.split('/');
+    let owner = path_parts.next().filter(|part| !part.is_empty());
+    let repository_name = path_parts.next().filter(|part| !part.is_empty());
+    if owner.is_none() || repository_name.is_none() || path_parts.next().is_some() {
+        anyhow::bail!("invalid GitHub repository URL: {repository}");
+    }
+    let repository_name = repository_name.unwrap().to_string();
+
+    let mut rev = None;
+    let mut tag = None;
+    let mut branch = None;
+    for item in query.split('&').filter(|item| !item.is_empty()) {
+        let Some((key, value)) = item.split_once('=') else {
+            continue;
+        };
+        validate_git_selector(value)?;
+        match key {
+            "rev" => rev = Some(value.to_string()),
+            "tag" => tag = Some(value.to_string()),
+            "branch" => branch = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    if rev.is_some() && tag.is_some() {
+        anyhow::bail!("Cargo Git source contains both rev and tag selectors: {source}");
+    }
+    let reference = if rev.is_some() {
+        LockedGitReference::Rev
+    } else if let Some(tag) = tag {
+        LockedGitReference::Tag(tag)
+    } else {
+        if branch.is_some() {
+            log::warn!(
+                "Cargo.lock selected a branch; using its resolved commit for a reproducible archive"
+            );
+        }
+        LockedGitReference::Commit
+    };
+
+    Ok(LockedGitSource {
+        repository: repository.to_string(),
+        repository_name,
+        commit: commit.to_ascii_lowercase(),
+        reference,
+    })
+}
+
+fn validate_git_selector(selector: &str) -> Result<()> {
+    if selector.is_empty()
+        || selector
+            .chars()
+            .any(|character| character.is_whitespace() || character == '%' || character == '#')
+    {
+        anyhow::bail!("unsupported Git selector in Cargo.lock: {selector:?}");
+    }
+    Ok(())
+}
+
+fn download_archive(url: &str) -> Result<Vec<u8>> {
+    log::info!("downloading Git source archive: {url}");
+    let response = ureq::AgentBuilder::new()
+        .redirects(10)
+        .build()
+        .get(url)
+        .call()
+        .with_context(|| format!("failed to download Git source archive: {url}"))?;
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read Git source archive: {url}"))?;
+    Ok(bytes)
+}
+
+fn archive_top_level_directory(bytes: &[u8]) -> Result<String> {
+    let mut archive = Archive::new(GzDecoder::new(Cursor::new(bytes)));
+    let mut top_level = None;
+    let mut entries = 0usize;
+    for entry in archive
+        .entries()
+        .context("failed to read Git source archive")?
+    {
+        let entry = entry.context("failed to read Git source archive entry")?;
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_pax_global_extensions()
+            || entry_type.is_pax_local_extensions()
+            || entry_type.is_gnu_longname()
+            || entry_type.is_gnu_longlink()
+        {
+            continue;
+        }
+        let path = entry
+            .path()
+            .context("failed to read Git source archive path")?;
+        let first = path
+            .components()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Git source archive contains an empty path"))?;
+        let Component::Normal(first) = first else {
+            anyhow::bail!(
+                "Git source archive contains an unsafe path: {}",
+                path.display()
+            );
+        };
+        let first = first
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Git source archive path is not UTF-8"))?;
+        match &top_level {
+            Some(existing) if existing != first => anyhow::bail!(
+                "Git source archive has multiple top-level entries: {:?} and {:?}",
+                existing,
+                first
+            ),
+            None => top_level = Some(first.to_string()),
+            _ => {}
+        }
+        entries += 1;
+    }
+    if entries == 0 {
+        anyhow::bail!("Git source archive is empty");
+    }
+    top_level.ok_or_else(|| anyhow::anyhow!("Git source archive has no top-level directory"))
+}
+
+fn lockfile_dependencies_for_package(
+    lockfile: &Path,
+    package_name: &str,
+    package_version: &str,
+) -> Result<Option<HashMap<String, semver::Version>>> {
+    let content = fs::read_to_string(lockfile)
+        .with_context(|| format!("Failed to read Cargo.lock: {:?}", lockfile))?;
+    let document: Value = toml::from_str(&content)
+        .with_context(|| format!("Failed to parse Cargo.lock: {:?}", lockfile))?;
+    let packages = document
+        .get("package")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("Cargo.lock has no package array: {:?}", lockfile))?;
+
+    let current = packages.iter().find(|package| {
+        package.get("name").and_then(Value::as_str) == Some(package_name)
+            && package.get("version").and_then(Value::as_str) == Some(package_version)
+    });
+    let Some(current) = current else {
+        log::warn!(
+            "Cargo.lock {:?} has no package {} {}; keeping Cargo.toml dependency ranges",
+            lockfile,
+            package_name,
+            package_version
+        );
+        return Ok(None);
+    };
+
+    let Some(dependencies) = current.get("dependencies").and_then(Value::as_array) else {
+        return Ok(Some(HashMap::new()));
+    };
+
+    let mut selected = HashMap::new();
+    let mut conflicts = BTreeSet::new();
+    for dependency in dependencies.iter().filter_map(Value::as_str) {
+        let mut fields = dependency.split_whitespace();
+        let Some(name) = fields.next() else {
+            continue;
+        };
+        let explicit_version = fields
+            .next()
+            .and_then(|field| semver::Version::parse(field).ok());
+        let candidates: Vec<_> = packages
+            .iter()
+            .filter(|package| package.get("name").and_then(Value::as_str) == Some(name))
+            .filter_map(|package| {
+                let version = package.get("version").and_then(Value::as_str)?;
+                semver::Version::parse(version).ok()
+            })
+            .filter(|version| {
+                explicit_version
+                    .as_ref()
+                    .is_none_or(|expected| version == expected)
+            })
+            .collect();
+
+        if candidates.len() != 1 {
+            log::warn!(
+                "Cargo.lock dependency {:?} of {} {} resolves to {} package entries; keeping its Cargo.toml range",
+                dependency,
+                package_name,
+                package_version,
+                candidates.len()
+            );
+            continue;
+        }
+
+        let version = candidates[0].clone();
+        match selected.get(name) {
+            Some(existing) if existing != &version => {
+                conflicts.insert(name.to_string());
+            }
+            None => {
+                selected.insert(name.to_string(), version);
+            }
+            _ => {}
+        }
+    }
+    for name in conflicts {
+        selected.remove(&name);
+        log::warn!(
+            "Cargo.lock selects multiple versions of dependency {} for {} {}; keeping its Cargo.toml range",
+            name,
+            package_name,
+            package_version
+        );
+    }
+    Ok(Some(selected))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        lockfile_dependencies_for_package, materialize_manifest_backed_temp_crate,
-        process_local_package, process_local_package_with_lockfile,
+        archive_top_level_directory, lockfile_dependencies_for_package,
+        materialize_manifest_backed_temp_crate, process_local_package,
+        process_local_package_with_lockfile, process_local_package_with_source,
     };
     use crate::package::PackageExecuteArgs;
     use crate::range_audit::RangeCapabilityPolicy;
 
+    use flate2::{Compression, write::GzEncoder};
     use semver::Version;
     use std::fs;
     use takopack_core::util::rust_crate_output_names;
+    use tar::{Builder, EntryType, Header};
+
+    fn write_test_git_archive(path: &std::path::Path, root: &str) {
+        let file = fs::File::create(path).unwrap();
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut archive = Builder::new(encoder);
+        let pax_content = b"19 comment=fixture\n";
+        let mut pax_header = Header::new_gnu();
+        pax_header.set_path("pax_global_header").unwrap();
+        pax_header.set_entry_type(EntryType::XGlobalHeader);
+        pax_header.set_size(pax_content.len() as u64);
+        pax_header.set_mode(0o644);
+        pax_header.set_mtime(0);
+        pax_header.set_cksum();
+        archive.append(&pax_header, &pax_content[..]).unwrap();
+        let content = b"[package]\nname = \"fixture\"\nversion = \"0.0.0\"\n";
+        let mut header = Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, format!("{root}/Cargo.toml"), &content[..])
+            .unwrap();
+        archive.finish().unwrap();
+        archive.into_inner().unwrap().finish().unwrap();
+    }
+
+    #[test]
+    fn git_archive_top_level_ignores_pax_global_header() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("source.tar.gz");
+        write_test_git_archive(&archive, "project-0123456789abcdef");
+
+        assert_eq!(
+            archive_top_level_directory(&fs::read(archive).unwrap()).unwrap(),
+            "project-0123456789abcdef"
+        );
+    }
 
     #[test]
     fn localpkg_materializes_declared_manifest_paths() {
@@ -774,94 +1205,99 @@ version = "0.14.0"
         assert!(spec.contains("Requires:       crate(itertools-0.14/default) >= 0.14.0"));
         assert!(!spec.contains("crate(itertools-0.10/"));
     }
-}
 
-fn lockfile_dependencies_for_package(
-    lockfile: &Path,
-    package_name: &str,
-    package_version: &str,
-) -> Result<Option<HashMap<String, semver::Version>>> {
-    let content = fs::read_to_string(lockfile)
-        .with_context(|| format!("Failed to read Cargo.lock: {:?}", lockfile))?;
-    let document: Value = toml::from_str(&content)
-        .with_context(|| format!("Failed to parse Cargo.lock: {:?}", lockfile))?;
-    let packages = document
-        .get("package")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow::anyhow!("Cargo.lock has no package array: {:?}", lockfile))?;
+    #[test]
+    fn localpkg_generates_locked_git_sources_for_rev_and_tag() {
+        struct Case<'a> {
+            name: &'a str,
+            version: &'a str,
+            source: &'a str,
+            archive_root: &'a str,
+            expected_macros: &'a [&'a str],
+            expected_source: &'a str,
+        }
 
-    let current = packages.iter().find(|package| {
-        package.get("name").and_then(Value::as_str) == Some(package_name)
-            && package.get("version").and_then(Value::as_str) == Some(package_version)
-    });
-    let Some(current) = current else {
-        log::warn!(
-            "Cargo.lock {:?} has no package {} {}; keeping Cargo.toml dependency ranges",
-            lockfile,
-            package_name,
-            package_version
-        );
-        return Ok(None);
-    };
+        let cases = [
+            Case {
+                name: "llm-multimodal",
+                version: "1.7.1",
+                source: "git+https://github.com/smg-project/llm-multimodal?rev=15adba5e025d8636ba4a334fb379b1371f6196a1#15adba5e025d8636ba4a334fb379b1371f6196a1",
+                archive_root: "llm-multimodal-15adba5e025d8636ba4a334fb379b1371f6196a1",
+                expected_macros: &["%global git_commit 15adba5e025d8636ba4a334fb379b1371f6196a1"],
+                expected_source: "Source:         https://github.com/smg-project/llm-multimodal/archive/%{git_commit}.tar.gz#/%{crate_name}-%{git_commit}.tar.gz",
+            },
+            Case {
+                name: "oss-harmony",
+                version: "0.0.11",
+                source: "git+https://github.com/oss-harmony/harmony?tag=v0.0.11#76e849426cc092f84509e31a17027755f67d662a",
+                archive_root: "harmony-0.0.11",
+                expected_macros: &[
+                    "%global git_tag v0.0.11",
+                    "%global git_commit 76e849426cc092f84509e31a17027755f67d662a",
+                ],
+                expected_source: "Source:         https://github.com/oss-harmony/harmony/archive/refs/tags/%{git_tag}.tar.gz#/%{crate_name}-%{git_tag}.tar.gz",
+            },
+        ];
 
-    let Some(dependencies) = current.get("dependencies").and_then(Value::as_array) else {
-        return Ok(Some(HashMap::new()));
-    };
+        for case in cases {
+            let source = tempfile::tempdir().unwrap();
+            let output = tempfile::tempdir().unwrap();
+            fs::write(
+                source.path().join("Cargo.toml"),
+                format!(
+                    "[package]\nname = {:?}\nversion = {:?}\nedition = \"2021\"\n",
+                    case.name, case.version
+                ),
+            )
+            .unwrap();
+            let lockfile = source.path().join("Cargo.lock");
+            fs::write(
+                &lockfile,
+                format!(
+                    "version = 4\n\n[[package]]\nname = {:?}\nversion = {:?}\nsource = {:?}\n",
+                    case.name, case.version, case.source
+                ),
+            )
+            .unwrap();
+            let archive = source.path().join("source.tar.gz");
+            write_test_git_archive(&archive, case.archive_root);
 
-    let mut selected = HashMap::new();
-    let mut conflicts = BTreeSet::new();
-    for dependency in dependencies.iter().filter_map(Value::as_str) {
-        let mut fields = dependency.split_whitespace();
-        let Some(name) = fields.next() else {
-            continue;
-        };
-        let explicit_version = fields
-            .next()
-            .and_then(|field| semver::Version::parse(field).ok());
-        let candidates: Vec<_> = packages
-            .iter()
-            .filter(|package| package.get("name").and_then(Value::as_str) == Some(name))
-            .filter_map(|package| {
-                let version = package.get("version").and_then(Value::as_str)?;
-                semver::Version::parse(version).ok()
-            })
-            .filter(|version| {
-                explicit_version
-                    .as_ref()
-                    .is_none_or(|expected| version == expected)
-            })
-            .collect();
+            let finish = PackageExecuteArgs {
+                changelog_ready: false,
+                copyright_guess_harder: false,
+                no_overlay_write_back: false,
+                with_spdx: true,
+                lockfile_deps: None,
+            };
+            process_local_package_with_source(
+                source.path(),
+                Some(output.path().to_path_buf()),
+                finish,
+                RangeCapabilityPolicy::Allow,
+                Some(&lockfile),
+                Some(&archive),
+            )
+            .unwrap();
 
-        if candidates.len() != 1 {
-            log::warn!(
-                "Cargo.lock dependency {:?} of {} {} resolves to {} package entries; keeping its Cargo.toml range",
-                dependency,
-                package_name,
-                package_version,
-                candidates.len()
+            let output_names =
+                rust_crate_output_names(case.name, &Version::parse(case.version).unwrap());
+            let spec = fs::read_to_string(
+                output
+                    .path()
+                    .join(output_names.directory)
+                    .join(output_names.spec_file),
+            )
+            .unwrap();
+            for expected in case.expected_macros {
+                assert!(spec.contains(expected), "missing {expected:?}:\n{spec}");
+            }
+            assert!(spec.contains(case.expected_source), "{spec}");
+            assert!(
+                spec.contains(&format!("BuildOption(prep):  -n {}", case.archive_root)),
+                "{spec}"
             );
-            continue;
-        }
-
-        let version = candidates[0].clone();
-        match selected.get(name) {
-            Some(existing) if existing != &version => {
-                conflicts.insert(name.to_string());
-            }
-            None => {
-                selected.insert(name.to_string(), version);
-            }
-            _ => {}
+            assert!(!spec.contains("sha256:\n"), "{spec}");
+            assert!(!spec.contains("static.crates.io"), "{spec}");
         }
     }
-    for name in conflicts {
-        selected.remove(&name);
-        log::warn!(
-            "Cargo.lock selects multiple versions of dependency {} for {} {}; keeping its Cargo.toml range",
-            name,
-            package_name,
-            package_version
-        );
-    }
-    Ok(Some(selected))
 }

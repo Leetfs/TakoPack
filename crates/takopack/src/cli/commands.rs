@@ -33,16 +33,18 @@ fn real_main() -> Result<i32> {
                 path,
                 output,
                 lockfile,
+                source_archive,
                 finish,
                 range_capability_policy,
             } => {
                 log::info!("packaging from local directory: {:?}", path);
-                takopack_rust::local::process_local_package_with_lockfile(
+                takopack_rust::local::process_local_package_with_source(
                     &path,
                     output,
                     finish,
                     range_capability_policy,
                     lockfile.as_deref(),
+                    source_archive.as_deref(),
                 )?;
                 Ok(0)
             }

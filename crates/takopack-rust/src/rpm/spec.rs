@@ -35,6 +35,7 @@ pub struct CrateRequirement {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SpecSource {
+    pub source_macros: Vec<(String, String)>,
     pub crate_name: String,
     pub full_version: String,
     pub pkgname: String,
@@ -45,6 +46,7 @@ pub struct SpecSource {
     pub url: String,
     pub source_url: String,
     pub sha256: Option<String>,
+    pub prep_dir: Option<String>,
     pub build_requires: Vec<String>,
     pub with_spdx: bool,
 }
@@ -140,6 +142,9 @@ pub fn render_header_section<W: Write>(out: &mut W, source: &SpecSource) -> fmt:
         write!(out, "{}", SPDX_HEADER)?;
         writeln!(out)?;
     }
+    for (name, value) in &source.source_macros {
+        writeln!(out, "%global {} {}", name, value)?;
+    }
     writeln!(out, "%global crate_name {}", source.crate_name)?;
     writeln!(out, "%global full_version {}", source.full_version)?;
     writeln!(out, "%global pkgname {}", source.pkgname)?;
@@ -158,6 +163,9 @@ pub fn render_header_section<W: Write>(out: &mut W, source: &SpecSource) -> fmt:
     writeln!(out, "Source:         {}", source.source_url)?;
     writeln!(out, "BuildArch:      noarch")?;
     writeln!(out, "BuildSystem:    rustcrates")?;
+    if let Some(ref prep_dir) = source.prep_dir {
+        writeln!(out, "BuildOption(prep):  -n {}", prep_dir)?;
+    }
     writeln!(out)?;
     Ok(())
 }
@@ -306,6 +314,7 @@ mod tests {
     fn renders_versioned_crate_capabilities_and_requirements() {
         let spec = RpmSpec {
             source: SpecSource {
+                source_macros: vec![],
                 crate_name: "serde_with".to_string(),
                 full_version: "3.18.0".to_string(),
                 pkgname: "serde-with-3".to_string(),
@@ -316,6 +325,7 @@ mod tests {
                 url: "https://example.invalid/serde_with".to_string(),
                 source_url: "https://static.crates.io/crates/%{crate_name}/%{full_version}/download#/%{name}-%{version}.tar.gz".to_string(),
                 sha256: None,
+                prep_dir: None,
                 build_requires: vec!["rust-rpm-macros".to_string()],
                 with_spdx: false,
             },
@@ -376,6 +386,7 @@ mod tests {
     fn renders_spdx_header_only_when_enabled() {
         let mut spec = RpmSpec {
             source: SpecSource {
+                source_macros: vec![],
                 crate_name: "serde".to_string(),
                 full_version: "1.0.0".to_string(),
                 pkgname: "serde-1".to_string(),
@@ -386,6 +397,7 @@ mod tests {
                 url: "https://example.invalid/serde".to_string(),
                 source_url: "https://example.invalid/source".to_string(),
                 sha256: None,
+                prep_dir: None,
                 build_requires: vec![],
                 with_spdx: false,
             },

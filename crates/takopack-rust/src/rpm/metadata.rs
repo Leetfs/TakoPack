@@ -10,8 +10,11 @@ use takopack_core::{
 
 use crate::{
     crates::dependency_is_runtime_candidate,
-    rpm::spec::{
-        self, CrateCapability, CrateRequirement, RequirementVersion, SpecPackage, SpecSource,
+    rpm::{
+        SourceArchiveOverride,
+        spec::{
+            self, CrateCapability, CrateRequirement, RequirementVersion, SpecPackage, SpecSource,
+        },
     },
 };
 
@@ -23,6 +26,7 @@ pub struct Source {
     crate_name: String,
     license: String,
     sha256: Option<String>, // SHA256 hash of the downloaded crate file
+    source_archive_override: Option<SourceArchiveOverride>,
     with_spdx: bool,
 }
 
@@ -211,7 +215,25 @@ impl fmt::Display for Source {
             self.version.clone()
         };
 
+        let (source_macros, source_url, sha256, prep_dir) = if let Some(source) =
+            &self.source_archive_override
+        {
+            (
+                source.source_macros.clone(),
+                source.source_url.clone(),
+                Some(source.sha256.clone()),
+                Some(source.prep_dir.clone()),
+            )
+        } else {
+            (
+                    Vec::new(),
+                    "https://static.crates.io/crates/%{crate_name}/%{full_version}/download#/%{name}-%{version}.tar.gz".to_string(),
+                    self.sha256.clone(),
+                    None,
+                )
+        };
         let source = SpecSource {
+            source_macros,
             crate_name: self.crate_name.clone(),
             full_version: self.full_version.clone(),
             pkgname,
@@ -228,9 +250,9 @@ impl fmt::Display for Source {
             } else {
                 "FIXME".to_string()
             },
-            // Use full version (including build metadata) in Source URL.
-            source_url: "https://static.crates.io/crates/%{crate_name}/%{full_version}/download#/%{name}-%{version}.tar.gz".to_string(),
-            sha256: self.sha256.clone(),
+            source_url,
+            sha256,
+            prep_dir,
             build_requires: vec!["rust-rpm-macros".to_string()],
             with_spdx: self.with_spdx,
         };
@@ -476,6 +498,7 @@ impl Source {
         license: &str,
         full_version: String,   // Full version including build metadata
         sha256: Option<String>, // SHA256 hash of downloaded crate file
+        source_archive_override: Option<SourceArchiveOverride>,
     ) -> Result<Source> {
         let pkgbase = match name_suffix {
             None => basename.to_string(),
@@ -489,6 +512,7 @@ impl Source {
             crate_name: crate_name.to_string(),
             license: license.to_string(),
             sha256,
+            source_archive_override,
             with_spdx: false,
         })
     }
@@ -858,6 +882,7 @@ mod tests {
             "https://example.invalid/clap",
             "MIT OR Apache-2.0",
             "4.6.1".to_string(),
+            None,
             None,
         )
         .unwrap();

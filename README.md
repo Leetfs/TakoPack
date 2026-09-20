@@ -107,6 +107,13 @@ takopack cargo localpkg <PATH> -o output_dir
 # 临时输出 TakoPack 内置 SPDX 头
 takopack cargo localpkg <PATH> --with-spdx
 
+# 为 Cargo.lock 中的 Git 依赖生成固定的 GitHub 源码归档信息
+takopack cargo localpkg <PATH> --lockfile ../Cargo.lock
+
+# 离线使用已下载的同一归档（仍由 TakoPack 计算哈希并检查解包目录）
+takopack cargo localpkg <PATH> --lockfile ../Cargo.lock \
+  --source-archive ../source.tar.gz
+
 # 示例
 takopack cargo localpkg ./my-project
 takopack cargo localpkg ./Cargo.toml -o specs/
@@ -121,6 +128,8 @@ takopack cargo localpkg ./Cargo.toml -o specs/
 - 适合本地开发和测试
 - 支持路径为目录或直接指向 Cargo.toml 文件
 - 自动处理本地依赖关系
+- `--lockfile` 会按名称和版本恢复 GitHub `rev`/`tag` 以及锁定的 commit，
+  生成 Git archive `Source`、SHA-256 和准确的 `BuildOption(prep)`；匹配不唯一时会报错
 
 #### 3. registry-sync - 同步 Registry
 

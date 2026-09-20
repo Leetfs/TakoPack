@@ -224,6 +224,7 @@ impl PackageProcess {
             args.copyright_guess_harder,
             !args.no_overlay_write_back,
             sha256.clone(),
+            None,
             args.lockfile_deps, // Pass lockfile dependencies
             args.with_spdx,
         )?;
