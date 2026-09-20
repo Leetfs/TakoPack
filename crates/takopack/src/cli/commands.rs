@@ -32,7 +32,6 @@ fn real_main() -> Result<i32> {
             CargoOpt::LocalPackage {
                 path,
                 output,
-                lockfile,
                 source_archive,
                 finish,
                 range_capability_policy,
@@ -43,7 +42,6 @@ fn real_main() -> Result<i32> {
                     output,
                     finish,
                     range_capability_policy,
-                    lockfile.as_deref(),
                     source_archive.as_deref(),
                 )?;
                 Ok(0)
@@ -78,7 +76,7 @@ fn real_main() -> Result<i32> {
 fn package_crate(
     init: PackageInitArgs,
     mut extract: PackageExtractArgs,
-    finish: PackageExecuteArgs,
+    mut finish: PackageExecuteArgs,
     range_capability_policy: RangeCapabilityPolicy,
 ) -> Result<i32> {
     use std::fs;
@@ -89,6 +87,14 @@ fn package_crate(
     let crate_name = process.crate_info().crate_name();
     let version = process.crate_info().version();
 
+    if let Some(lockfile) = finish.lockfile.as_deref() {
+        finish.lockfile_deps = takopack_rust::local::lockfile_dependencies_for_package(
+            lockfile,
+            crate_name,
+            &version.to_string(),
+        )?;
+    }
+
     let output_names = takopack_core::util::rust_crate_output_names(crate_name, version);
     let final_output =
         takopack_core::util::package_final_output_dir(extract.directory.as_deref(), &output_names)?;
@@ -97,10 +103,17 @@ fn package_crate(
     process.extract(extract)?;
     process.apply_overrides()?;
     if range_capability_policy != RangeCapabilityPolicy::Allow {
-        let warnings = range_audit::audit_cargo_dependencies(
+        let mut warnings = range_audit::audit_cargo_dependencies(
             process.crate_info().dependencies(),
             Some(&output_names.directory),
         );
+        if let Some(lockfile_deps) = finish.lockfile_deps.as_ref() {
+            warnings.retain(|warning| {
+                let dash_name = warning.dependency.replace('_', "-");
+                !lockfile_deps.contains_key(&warning.dependency)
+                    && !lockfile_deps.contains_key(&dash_name)
+            });
+        }
         if range_audit::emit_warnings(&warnings, range_capability_policy) {
             anyhow::bail!("range capability audit failed (policy: error)");
         }

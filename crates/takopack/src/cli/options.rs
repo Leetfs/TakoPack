@@ -61,10 +61,6 @@ pub enum CargoOpt {
         )]
         output: Option<std::path::PathBuf>,
 
-        /// Cargo.lock containing exact dependency and Git source selections.
-        #[arg(long, value_name = "PATH")]
-        lockfile: Option<std::path::PathBuf>,
-
         /// Previously downloaded Git archive to hash and inspect instead of downloading it.
         #[arg(long, value_name = "PATH", requires = "lockfile")]
         source_archive: Option<std::path::PathBuf>,
@@ -128,4 +124,30 @@ pub enum PyOpt {
         #[arg(short, long, value_name = "DIR")]
         output: Option<std::path::PathBuf>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CargoOpt, Cli, Opt};
+    use clap::Parser;
+    use std::path::PathBuf;
+
+    #[test]
+    fn registry_package_accepts_lockfile() {
+        let cli = Cli::try_parse_from([
+            "takopack",
+            "cargo",
+            "package",
+            "prost-derive",
+            "0.14.3",
+            "--lockfile",
+            "Cargo.lock",
+        ])
+        .unwrap();
+
+        let Opt::Cargo(CargoOpt::Package { finish, .. }) = cli.command else {
+            panic!("expected cargo package command");
+        };
+        assert_eq!(finish.lockfile, Some(PathBuf::from("Cargo.lock")));
+    }
 }

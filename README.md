@@ -65,6 +65,9 @@ takopack cargo pkg <CRATE_NAME> <VERSION> --directory output_dir
 # 临时输出 TakoPack 内置 SPDX 头
 takopack cargo pkg <CRATE_NAME> <VERSION> --with-spdx
 
+# 使用工作区 Cargo.lock 选中的精确依赖版本生成 RPM capability
+takopack cargo pkg prost-derive 0.14.3 --lockfile ../Cargo.lock
+
 # 示例
 takopack cargo pkg serde 1.0.210
 takopack cargo pkg tokio

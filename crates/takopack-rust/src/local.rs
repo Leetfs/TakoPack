@@ -22,32 +22,19 @@ pub fn process_local_package(
     finish_args: PackageExecuteArgs,
     range_capability_policy: RangeCapabilityPolicy,
 ) -> Result<()> {
-    process_local_package_with_source(
-        path,
-        output_dir,
-        finish_args,
-        range_capability_policy,
-        None,
-        None,
-    )
+    process_local_package_with_source(path, output_dir, finish_args, range_capability_policy, None)
 }
 
 /// Process a local crate using exact dependency versions from Cargo.lock.
 pub fn process_local_package_with_lockfile(
     path: &Path,
     output_dir: Option<PathBuf>,
-    finish_args: PackageExecuteArgs,
+    mut finish_args: PackageExecuteArgs,
     range_capability_policy: RangeCapabilityPolicy,
     lockfile: Option<&Path>,
 ) -> Result<()> {
-    process_local_package_with_source(
-        path,
-        output_dir,
-        finish_args,
-        range_capability_policy,
-        lockfile,
-        None,
-    )
+    finish_args.lockfile = lockfile.map(Path::to_path_buf);
+    process_local_package_with_source(path, output_dir, finish_args, range_capability_policy, None)
 }
 
 /// Process a local crate while recovering a reproducible Git source from the
@@ -61,10 +48,9 @@ pub fn process_local_package_with_source(
     output_dir: Option<PathBuf>,
     finish_args: PackageExecuteArgs,
     range_capability_policy: RangeCapabilityPolicy,
-    lockfile: Option<&Path>,
     source_archive: Option<&Path>,
 ) -> Result<()> {
-    if source_archive.is_some() && lockfile.is_none() {
+    if source_archive.is_some() && finish_args.lockfile.is_none() {
         anyhow::bail!("--source-archive requires --lockfile");
     }
 
@@ -112,7 +98,6 @@ pub fn process_local_package_with_source(
         output_dir,
         finish_args,
         range_capability_policy,
-        lockfile,
         source_archive,
     )
 }
@@ -309,7 +294,6 @@ fn process_complete_crate(
     output_dir: Option<PathBuf>,
     mut finish_args: PackageExecuteArgs,
     range_capability_policy: RangeCapabilityPolicy,
-    lockfile: Option<&Path>,
     source_archive: Option<&Path>,
 ) -> Result<()> {
     // Load config if available
@@ -331,7 +315,7 @@ fn process_complete_crate(
 
     log::info!("Crate: {} {}", crate_name, version);
 
-    if let Some(lockfile) = lockfile {
+    if let Some(lockfile) = finish_args.lockfile.as_deref() {
         finish_args.lockfile_deps =
             lockfile_dependencies_for_package(lockfile, crate_name, &version.to_string())?;
     }
@@ -342,7 +326,7 @@ fn process_complete_crate(
 
     let output_names = takopack_core::util::rust_crate_output_names(crate_name, version);
 
-    let source_archive_override = match lockfile {
+    let source_archive_override = match finish_args.lockfile.as_deref() {
         Some(lock) => git_archive_source_from_lockfile(lock, crate_name, version, source_archive)?,
         None => None,
     };
@@ -695,7 +679,7 @@ fn archive_top_level_directory(bytes: &[u8]) -> Result<String> {
     top_level.ok_or_else(|| anyhow::anyhow!("Git source archive has no top-level directory"))
 }
 
-fn lockfile_dependencies_for_package(
+pub fn lockfile_dependencies_for_package(
     lockfile: &Path,
     package_name: &str,
     package_version: &str,
@@ -1018,6 +1002,7 @@ edition = "2021"
             copyright_guess_harder: false,
             no_overlay_write_back: false,
             with_spdx: false,
+            lockfile: None,
             lockfile_deps: None,
         };
 
@@ -1066,6 +1051,7 @@ rustls = { version = "0.21", optional = true }
             copyright_guess_harder: false,
             no_overlay_write_back: false,
             with_spdx: false,
+            lockfile: None,
             lockfile_deps: None,
         };
 
@@ -1181,6 +1167,7 @@ version = "0.14.0"
             copyright_guess_harder: false,
             no_overlay_write_back: false,
             with_spdx: false,
+            lockfile: None,
             lockfile_deps: None,
         };
         let output_names =
@@ -1267,6 +1254,7 @@ version = "0.14.0"
                 copyright_guess_harder: false,
                 no_overlay_write_back: false,
                 with_spdx: true,
+                lockfile: Some(lockfile.clone()),
                 lockfile_deps: None,
             };
             process_local_package_with_source(
@@ -1274,7 +1262,6 @@ version = "0.14.0"
                 Some(output.path().to_path_buf()),
                 finish,
                 RangeCapabilityPolicy::Allow,
-                Some(&lockfile),
                 Some(&archive),
             )
             .unwrap();

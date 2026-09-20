@@ -54,6 +54,9 @@ pub struct PackageExecuteArgs {
     /// Include TakoPack's built-in SPDX header in generated spec files.
     #[arg(long)]
     pub with_spdx: bool,
+    /// Cargo.lock containing the exact dependency selection for this package.
+    #[arg(long, value_name = "PATH")]
+    pub lockfile: Option<PathBuf>,
     /// Optional dependencies from Cargo.lock for accurate spec generation.
     #[arg(skip)]
     pub lockfile_deps: Option<std::collections::HashMap<String, semver::Version>>,
