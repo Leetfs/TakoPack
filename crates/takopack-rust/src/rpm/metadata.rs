@@ -33,7 +33,7 @@ pub struct Source {
 pub struct Package {
     name: String,
     crate_deps: Vec<CrateDep>, // Structured dependencies for crate() format
-    crate_requires: Vec<CrateRequirement>, // Structured external crate requirements from Cargo.toml
+    crate_requires: Vec<CargoCrateRequirement>, // Structured external crate requirements from Cargo.toml
     feature_provides: Vec<String>, // Structured Cargo feature aliases provided by this package
     summary: Description,
     description: Description,
@@ -41,6 +41,12 @@ pub struct Package {
     feature: Option<String>, // Original feature name, None for base package
     crate_name: Option<String>, // Original crate name for proper feature extraction
     all_features: Vec<String>, // All features available in Cargo.toml (only for base package)
+}
+
+#[derive(Clone, Debug)]
+struct CargoCrateRequirement {
+    package_name: String,
+    requirement: CrateRequirement,
 }
 
 pub struct Description {
@@ -266,7 +272,7 @@ impl fmt::Display for Source {
 fn crate_requirements_from_cargo_deps(
     deps: &[Dependency],
     current_crate_name: &str,
-) -> Vec<CrateRequirement> {
+) -> Vec<CargoCrateRequirement> {
     use cargo::core::dependency::DepKind;
 
     let mut requirements = std::collections::BTreeMap::new();
@@ -317,7 +323,13 @@ fn crate_requirements_from_cargo_deps(
                 feature,
                 requirement: requirement.clone(),
             };
-            requirements.insert(crate_requirement_key(&requirement), requirement);
+            requirements.insert(
+                crate_requirement_key(&requirement),
+                CargoCrateRequirement {
+                    package_name: dep.package_name().as_str().to_string(),
+                    requirement,
+                },
+            );
         }
     }
 
@@ -546,7 +558,7 @@ impl Package {
             std::collections::BTreeMap::new();
 
         for requirement in &self.crate_requires {
-            insert_crate_requirement(&mut dep_map, requirement.clone());
+            insert_crate_requirement(&mut dep_map, requirement.requirement.clone());
         }
 
         for dep in &self.crate_deps {
@@ -619,25 +631,12 @@ impl Package {
             }
         }
 
-        for requirement in &mut self.crate_requires {
-            let selected = lockfile_deps
-                .iter()
-                .filter_map(|(name, version)| {
-                    let crate_base = spec::normalize_crate_name(name);
-                    if requirement.crate_name == crate_base
-                        || requirement
-                            .crate_name
-                            .starts_with(&format!("{}-", crate_base))
-                    {
-                        Some((crate_base, version))
-                    } else {
-                        None
-                    }
-                })
-                .max_by_key(|(crate_base, _)| crate_base.len());
-            let Some((crate_base, version)) = selected else {
+        for cargo_requirement in &mut self.crate_requires {
+            let Some(version) = lockfile_deps.get(&cargo_requirement.package_name) else {
                 continue;
             };
+            let crate_base = spec::normalize_crate_name(&cargo_requirement.package_name);
+            let requirement = &mut cargo_requirement.requirement;
 
             requirement.crate_name = if !version.pre.is_empty() {
                 format!(
@@ -861,7 +860,7 @@ mod tests {
     ) -> Vec<String> {
         crate_requirements_from_cargo_deps(deps, current_crate_name)
             .into_iter()
-            .map(|requirement| spec::render_crate_requires(&requirement))
+            .map(|requirement| spec::render_crate_requires(&requirement.requirement))
             .collect()
     }
 

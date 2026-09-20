@@ -1194,6 +1194,78 @@ version = "0.14.0"
     }
 
     #[test]
+    fn lockfile_does_not_rewrite_hyphen_prefixed_dependency() {
+        let source = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        fs::write(
+            source.path().join("Cargo.toml"),
+            r#"
+[package]
+name = "prefix_consumer"
+version = "1.2.3"
+edition = "2021"
+
+[dependencies]
+tower = { version = "0.5.2", default-features = false, features = ["util"] }
+tower-http = { version = "0.6.0", optional = true, default-features = false, features = ["cors"] }
+
+[features]
+docs = ["dep:tower-http"]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            source.path().join("Cargo.lock"),
+            r#"
+version = 4
+
+[[package]]
+name = "prefix_consumer"
+version = "1.2.3"
+dependencies = [
+ "tower",
+]
+
+[[package]]
+name = "tower"
+version = "0.5.3"
+"#,
+        )
+        .unwrap();
+
+        let finish = PackageExecuteArgs {
+            changelog_ready: false,
+            copyright_guess_harder: false,
+            no_overlay_write_back: false,
+            with_spdx: false,
+            lockfile: None,
+            lockfile_deps: None,
+        };
+        let output_names =
+            rust_crate_output_names("prefix_consumer", &Version::parse("1.2.3").unwrap());
+        let output_root = output.path().join("explicit-output-root");
+
+        process_local_package_with_lockfile(
+            source.path(),
+            Some(output_root.clone()),
+            finish,
+            RangeCapabilityPolicy::Error,
+            Some(&source.path().join("Cargo.lock")),
+        )
+        .unwrap();
+
+        let spec = fs::read_to_string(
+            output_root
+                .join(&output_names.directory)
+                .join(&output_names.spec_file),
+        )
+        .unwrap();
+        assert!(spec.contains("Requires:       crate(tower-0.5/util) >= 0.5.3"));
+        assert!(spec.contains("Requires:       crate(tower-http-0.6/cors) >= 0.6.0"));
+        assert!(!spec.contains("crate(tower-0.5/cors)"));
+    }
+
+    #[test]
     fn localpkg_generates_locked_git_sources_for_rev_and_tag() {
         struct Case<'a> {
             name: &'a str,
