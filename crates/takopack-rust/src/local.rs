@@ -573,4 +573,65 @@ edition = "2021"
         assert!(package_dir.join("Cargo.toml").exists());
         assert!(!output_root.join(&output_names.spec_file).exists());
     }
+
+    #[test]
+    fn localpkg_merges_features_with_the_same_normalized_rpm_name() {
+        let source = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        fs::write(
+            source.path().join("Cargo.toml"),
+            r#"
+[package]
+name = "feature_collision"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+__rustls = ["rustls"]
+rustls-tls-manual-roots = ["__rustls"]
+
+[dependencies]
+rustls = { version = "0.21", optional = true }
+"#,
+        )
+        .unwrap();
+
+        let finish = PackageExecuteArgs {
+            changelog_ready: false,
+            copyright_guess_harder: false,
+            no_overlay_write_back: false,
+            with_spdx: false,
+            lockfile_deps: None,
+        };
+
+        let output_names =
+            rust_crate_output_names("feature_collision", &Version::parse("0.1.0").unwrap());
+        let output_root = output.path().join("explicit-output-root");
+
+        process_local_package(
+            source.path(),
+            Some(output_root.clone()),
+            finish,
+            RangeCapabilityPolicy::Allow,
+        )
+        .unwrap();
+
+        let spec = fs::read_to_string(
+            output_root
+                .join(&output_names.directory)
+                .join(&output_names.spec_file),
+        )
+        .unwrap();
+        assert_eq!(
+            1,
+            spec.lines()
+                .filter(|line| *line == "%package     -n %{name}+rustls")
+                .count(),
+            "normalized feature names must identify a single RPM subpackage:\n{spec}"
+        );
+        assert!(spec.contains("Requires:       crate(rustls-0.21/default) >= 0.21.0"));
+        assert!(
+            spec.contains("Provides:       crate(%{pkgname}/rustls-tls-manual-roots) = %{version}")
+        );
+    }
 }

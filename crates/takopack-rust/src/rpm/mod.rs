@@ -615,7 +615,7 @@ fn transform_feature_packages(
                 log::debug!("transitive deps of feature {}: {:?}", f, dep_feats);
                 takopack_bail!(
                     "Tried to merge features {} and {} as they are not representable separately\n\
-                     in takopack, but this resulted in a feature cycle. You need to manually patch the package.",
+                     in takopack, but this resulted in a feature cycle. Adjust the supported input or fix the generator.",
                     f,
                     f_
                 );
@@ -623,8 +623,8 @@ fn transform_feature_packages(
                 takopack_warn!(
                     "Merged features {} and {} as they are not representable separately in takopack.\n\
                      We checked that this does not break the package in an obvious way (feature cycle), however\n\
-                     if there is a more sophisticated breakage, you'll have to manually patch those \
-                     features instead.",
+                     if there is a more sophisticated breakage, adjust the supported input or fix the \
+                     generator instead.",
                     f,
                     f_
                 );
