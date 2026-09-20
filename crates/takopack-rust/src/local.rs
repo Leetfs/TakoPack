@@ -1025,6 +1025,69 @@ edition = "2021"
     }
 
     #[test]
+    fn localpkg_binary_only_provides_base_and_default_capabilities() {
+        let source = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        fs::write(
+            source.path().join("Cargo.toml"),
+            r#"
+[package]
+name = "binary_only"
+version = "0.1.0"
+edition = "2021"
+autolib = false
+
+[[bin]]
+name = "binary-only"
+path = "src/main.rs"
+"#,
+        )
+        .unwrap();
+
+        let finish = PackageExecuteArgs {
+            changelog_ready: false,
+            copyright_guess_harder: false,
+            no_overlay_write_back: false,
+            with_spdx: false,
+            lockfile: None,
+            lockfile_deps: None,
+        };
+        let output_names =
+            rust_crate_output_names("binary_only", &Version::parse("0.1.0").unwrap());
+        let output_root = output.path().join("explicit-output-root");
+
+        process_local_package(
+            source.path(),
+            Some(output_root.clone()),
+            finish,
+            RangeCapabilityPolicy::Allow,
+        )
+        .unwrap();
+
+        let spec = fs::read_to_string(
+            output_root
+                .join(&output_names.directory)
+                .join(&output_names.spec_file),
+        )
+        .unwrap();
+        assert_eq!(
+            1,
+            spec.lines()
+                .filter(|line| *line == "Provides:       crate(%{pkgname}) = %{version}")
+                .count()
+        );
+        assert_eq!(
+            1,
+            spec.lines()
+                .filter(|line| {
+                    *line == "Provides:       crate(%{pkgname}/default) = %{version}"
+                })
+                .count()
+        );
+        assert!(!spec.contains("%package     -n %{name}+default"));
+    }
+
+    #[test]
     fn localpkg_merges_features_with_the_same_normalized_rpm_name() {
         let source = tempfile::tempdir().unwrap();
         let output = tempfile::tempdir().unwrap();

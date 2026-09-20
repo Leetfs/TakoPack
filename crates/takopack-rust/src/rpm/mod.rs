@@ -21,7 +21,9 @@ use self::spec::{
     SpecFiles, render_build_check_install_placeholder, render_changelog_section,
     render_files_section, render_patch_prep_placeholder,
 };
-use crate::crates::{CrateDepInfo, CrateInfo, all_dependencies_and_features, show_dep};
+use crate::crates::{
+    CrateDepInfo, CrateInfo, all_dependencies_and_features, show_dep, transitive_deps,
+};
 
 pub mod metadata;
 pub mod spec;
@@ -783,8 +785,7 @@ fn write_binary_only_package(
     description_prefix: &str,
     lockfile_deps: Option<&HashMap<String, semver::Version>>,
 ) -> Result<()> {
-    let empty_deps = (vec![], vec![]);
-    let (_, base_deps) = features_with_deps.get("").unwrap_or(&empty_deps);
+    let (_, default_deps) = transitive_deps(features_with_deps, "default")?;
     let description_suffix = binary_description_suffix(crate_name, bins);
 
     let mut package = Package::new(
@@ -800,8 +801,8 @@ fn write_binary_only_package(
         },
         None,
         vec![],
-        base_deps.clone(),
-        vec![],
+        default_deps,
+        vec!["default"],
         vec![],
     )?;
 
