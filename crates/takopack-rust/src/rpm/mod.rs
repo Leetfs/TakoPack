@@ -577,11 +577,15 @@ fn transform_feature_packages(
 ) -> Result<TransformedFeatures> {
     let potential_corner_case = working_features_with_deps
         .keys()
-        .filter(|x| base_crate_package_name(x).as_str() != **x)
+        .filter(|x| spec::normalize_feature_name(x).as_str() != **x)
         .cloned()
         .collect::<Vec<_>>();
     for f in potential_corner_case {
-        let f_ = base_crate_package_name(f);
+        // Feature RPM names use normalize_feature_name(), which also strips
+        // leading '-' characters.  Detect collisions with that exact
+        // normalization so private features such as `__rustls` are merged
+        // with `rustls` before the Spec is rendered.
+        let f_ = spec::normalize_feature_name(f);
         if let Some((df1, dd1)) = working_features_with_deps.remove(f_.as_str()) {
             working_features_with_deps
                 .entry(f)
@@ -714,6 +718,31 @@ fn package_description_suffix(crate_name: &str, feature: &str, f_provides: &[&st
                 ),
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_and_public_features_collapse_to_one_rpm_name() {
+        let mut features = CrateDepInfo::new();
+        features.insert("", (Vec::new(), Vec::new()));
+        features.insert("__rustls", (Vec::new(), Vec::new()));
+        features.insert("rustls", (Vec::new(), Vec::new()));
+
+        let transformed = transform_feature_packages(features, &Config::default()).unwrap();
+        let normalized_rustls_names = transformed
+            .reduced_features_with_deps
+            .keys()
+            .copied()
+            .chain(transformed.provides.values().flatten().copied())
+            .filter(|feature| !feature.is_empty())
+            .filter(|feature| spec::normalize_feature_name(feature) == "rustls")
+            .count();
+
+        assert_eq!(normalized_rustls_names, 1);
     }
 }
 
