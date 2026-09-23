@@ -388,6 +388,14 @@ pub fn prepare_takopack_folder(
         with_spdx,
     )?;
 
+    if !crate_info.version().pre.is_empty() {
+        let spec_name =
+            util::rust_crate_output_names(crate_info.crate_name(), crate_info.version()).spec_file;
+        let spec_path = tempdir.path().join(spec_name);
+        let rendered = fs::read_to_string(&spec_path)?;
+        fs::write(&spec_path, render_prerelease_spec(&rendered)?)?;
+    }
+
     if overlay_write_back {
         let overlay = config.overlay_dir(config_path);
         if let Some(p) = overlay.as_ref() {
@@ -402,6 +410,24 @@ pub fn prepare_takopack_folder(
 
     fs::rename(tempdir.path(), output_dir.join("takopack"))?;
     Ok(())
+}
+
+fn render_prerelease_spec(rendered: &str) -> Result<String> {
+    const REGISTRY_PATH: &str = "%{_datadir}/cargo/registry/%{crate_name}-%{version}/";
+    const FULL_REGISTRY_PATH: &str = "%{_datadir}/cargo/registry/%{crate_name}-%{full_version}/";
+    const FILES_MARKER: &str = "\n%files\n";
+    const INSTALL_SECTION: &str = "\n%install\n%rust_install_crate\nmv %{buildroot}%{_datadir}/cargo/registry/%{crate_name}-%{version} %{buildroot}%{_datadir}/cargo/registry/%{crate_name}-%{full_version}\n\n%files\n";
+
+    if !rendered.contains(REGISTRY_PATH)
+        || !rendered.contains("= %{version}")
+        || rendered.matches(FILES_MARKER).count() != 1
+    {
+        takopack_bail!("unexpected Rust prerelease spec structure");
+    }
+
+    let rendered = rendered.replace("= %{version}", "= %{full_version}");
+    let rendered = rendered.replace(REGISTRY_PATH, FULL_REGISTRY_PATH);
+    Ok(rendered.replacen(FILES_MARKER, INSTALL_SECTION, 1))
 }
 
 fn prepare_takopack_spec<F: FnMut(&str) -> std::result::Result<fs::File, io::Error>>(
@@ -750,6 +776,16 @@ fn package_description_suffix(crate_name: &str, feature: &str, f_provides: &[&st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prerelease_spec_uses_exact_crate_version_and_registry_path() {
+        let input = "Provides:       crate(%{pkgname}) = %{version}\nRequires:       crate(%{pkgname}) = %{version}\n\n%files\n%{_datadir}/cargo/registry/%{crate_name}-%{version}/\n";
+        let rendered = render_prerelease_spec(input).unwrap();
+        assert!(rendered.contains("crate(%{pkgname}) = %{full_version}"));
+        assert!(rendered.contains("%install\n%rust_install_crate\nmv "));
+        assert!(rendered.contains("%{_datadir}/cargo/registry/%{crate_name}-%{full_version}/"));
+        assert!(!rendered.contains("crate(%{pkgname}) = %{version}"));
+    }
 
     #[test]
     fn private_and_public_features_collapse_to_one_rpm_name() {
