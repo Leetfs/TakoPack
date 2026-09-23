@@ -388,12 +388,12 @@ pub fn prepare_takopack_folder(
         with_spdx,
     )?;
 
-    if !crate_info.version().pre.is_empty() {
+    if !crate_info.version().pre.is_empty() || !crate_info.version().build.is_empty() {
         let spec_name =
             util::rust_crate_output_names(crate_info.crate_name(), crate_info.version()).spec_file;
         let spec_path = tempdir.path().join(spec_name);
         let rendered = fs::read_to_string(&spec_path)?;
-        fs::write(&spec_path, render_prerelease_spec(&rendered)?)?;
+        fs::write(&spec_path, render_exact_crate_version_spec(&rendered)?)?;
     }
 
     if overlay_write_back {
@@ -412,7 +412,7 @@ pub fn prepare_takopack_folder(
     Ok(())
 }
 
-fn render_prerelease_spec(rendered: &str) -> Result<String> {
+fn render_exact_crate_version_spec(rendered: &str) -> Result<String> {
     const REGISTRY_PATH: &str = "%{_datadir}/cargo/registry/%{crate_name}-%{version}/";
     const FULL_REGISTRY_PATH: &str = "%{_datadir}/cargo/registry/%{crate_name}-%{full_version}/";
     const FILES_MARKER: &str = "\n%files\n";
@@ -422,7 +422,7 @@ fn render_prerelease_spec(rendered: &str) -> Result<String> {
         || !rendered.contains("= %{version}")
         || rendered.matches(FILES_MARKER).count() != 1
     {
-        takopack_bail!("unexpected Rust prerelease spec structure");
+        takopack_bail!("unexpected Rust exact-version spec structure");
     }
 
     let rendered = rendered.replace("= %{version}", "= %{full_version}");
@@ -778,9 +778,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prerelease_spec_uses_exact_crate_version_and_registry_path() {
+    fn nonstandard_spec_uses_exact_crate_version_and_registry_path() {
         let input = "Provides:       crate(%{pkgname}) = %{version}\nRequires:       crate(%{pkgname}) = %{version}\n\n%files\n%{_datadir}/cargo/registry/%{crate_name}-%{version}/\n";
-        let rendered = render_prerelease_spec(input).unwrap();
+        let rendered = render_exact_crate_version_spec(input).unwrap();
         assert!(rendered.contains("crate(%{pkgname}) = %{full_version}"));
         assert!(rendered.contains("%install\n%rust_install_crate\nmv "));
         assert!(rendered.contains("%{_datadir}/cargo/registry/%{crate_name}-%{full_version}/"));
