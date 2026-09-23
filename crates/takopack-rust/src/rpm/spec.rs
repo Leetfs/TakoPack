@@ -148,6 +148,10 @@ pub fn render_header_section<W: Write>(out: &mut W, source: &SpecSource) -> fmt:
     writeln!(out, "%global crate_name {}", source.crate_name)?;
     writeln!(out, "%global full_version {}", source.full_version)?;
     writeln!(out, "%global pkgname {}", source.pkgname)?;
+    writeln!(
+        out,
+        "%global __requires_exclude_from ^%{{_datadir}}/cargo/registry/.*$"
+    )?;
     writeln!(out)?;
     writeln!(out, "Name:           {}", source.rpm_name)?;
     writeln!(out, "Version:        {}", source.rpm_version)?;
@@ -370,6 +374,9 @@ mod tests {
 
         let rendered = spec.render();
         assert!(!rendered.starts_with("# SPDX-FileCopyrightText:"));
+        assert!(
+            rendered.contains("%global __requires_exclude_from ^%{_datadir}/cargo/registry/.*$")
+        );
         assert!(rendered.contains("Provides:       crate(%{pkgname}) = %{version}"));
         assert!(rendered.contains("%package     -n %{name}+default"));
         assert!(rendered.contains("Provides:       crate(%{pkgname}/default) = %{version}"));
